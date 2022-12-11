@@ -101,7 +101,44 @@ void insert_tlb(unsigned int vpn, unsigned int pfn)
  */
 unsigned int alloc_page(unsigned int vpn, unsigned int rw)
 {
-	return -1;
+	int pd_index = vpn / NR_PTES_PER_PAGE;
+	int pte_index = vpn % NR_PTES_PER_PAGE;
+	
+	struct pagetable *pt = ptbr;
+	struct pte_directory *pd;
+	struct pte *pte;
+	
+	if (!pt){
+		fprintf(stderr,"Page Table is NULL!\n");
+		return -1;
+	}
+	pd = pt->outer_ptes[pd_index];
+	
+	if (!pd){
+		pt->outer_ptes[pd_index] = (struct pte_directory*)malloc(sizeof(struct pte_directory));
+		pd = pt->outer_ptes[pd_index];
+	}
+
+	pte = &pd->ptes[pte_index];
+
+	pte->valid = true;
+	
+	if(rw == RW_WRITE+RW_READ){
+		pte->writable = true;
+	}else if(rw == RW_WRITE){
+		fprintf(stderr,"Don't alloc Write only\n");
+	}
+	
+	pte->pfn = -1;
+		
+	for(unsigned int i=0;i<NR_PAGEFRAMES;i++)
+		if(!mapcounts[i]){
+			pte->pfn = i;
+			mapcounts[i]++;
+			break;
+		}
+	
+	return pte->pfn;
 }
 
 
@@ -116,6 +153,32 @@ unsigned int alloc_page(unsigned int vpn, unsigned int rw)
  */
 void free_page(unsigned int vpn)
 {
+	int pd_index = vpn / NR_PTES_PER_PAGE;
+	int pte_index = vpn % NR_PTES_PER_PAGE;
+	
+	struct pagetable *pt = ptbr;
+	struct pte_directory *pd;
+	struct pte *pte;
+	
+	pd = pt->outer_ptes[pd_index];
+
+	pte = &pd->ptes[pte_index];
+	
+	if(mapcounts[pte->pfn]>=2){
+		mapcounts[pte->pfn]--; // count 내렸지만, 접근 불가 힘듬
+		mapcounts[pte->pfn]=0;
+		pte->valid=false;
+		pte->writable=false;
+		pte->pfn=0;
+	}else{
+		mapcounts[pte->pfn]=0;
+		pte->valid=false;
+		pte->writable=false;
+		pte->pfn=0;
+	}
+	
+	
+	
 }
 
 
@@ -161,5 +224,21 @@ bool handle_page_fault(unsigned int vpn, unsigned int rw)
  */
 void switch_process(unsigned int pid)
 {
+	struct process *a;
+	
+	list_for_each_entry(a, &processes, list){
+		if(a->pid == pid)
+			break;
+		else
+			a = NULL;
+	}
+	if(!a){
+		//fork
+	}else{
+		struct process *new = (struct process*)malloc(sizeof(struct process));
+		new->pid = pid;
+		new->pagetable = current->pagetable;
+		new->list = current // PRODUCTING
+	}
 }
 
