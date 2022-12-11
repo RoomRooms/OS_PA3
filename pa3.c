@@ -66,6 +66,16 @@ extern unsigned int mapcounts[];
  */
 bool lookup_tlb(unsigned int vpn, unsigned int *pfn)
 {
+	for (int i = 0; i < sizeof(tlb) / sizeof(*tlb); i++) {
+		struct tlb_entry *t = tlb + i;
+
+		if (!t->valid) continue;
+		else
+			if(t->vpn == vpn){
+				*pfn = t->pfn;
+				return true;
+			}
+	}
 	return false;
 }
 
@@ -80,6 +90,16 @@ bool lookup_tlb(unsigned int vpn, unsigned int *pfn)
  */
 void insert_tlb(unsigned int vpn, unsigned int pfn)
 {
+	for (int i = 0; i < sizeof(tlb) / sizeof(*tlb); i++) {
+		struct tlb_entry *t = tlb + i;
+
+		if (!t->valid){
+			t->valid = true;
+			t->vpn = vpn;
+			t->pfn = pfn;
+			break;
+		}
+	}
 }
 
 
@@ -122,11 +142,10 @@ unsigned int alloc_page(unsigned int vpn, unsigned int rw)
 	pte = &pd->ptes[pte_index];
 
 	pte->valid = true;
+	pte->private = 0;
 	
-	if(rw == RW_WRITE+RW_READ){
+	if(rw >= RW_WRITE){
 		pte->writable = true;
-	}else if(rw == RW_WRITE){
-		fprintf(stderr,"Don't alloc Write only\n");
 	}
 	
 	pte->pfn = -1;
@@ -155,6 +174,7 @@ void free_page(unsigned int vpn)
 {
 	int pd_index = vpn / NR_PTES_PER_PAGE;
 	int pte_index = vpn % NR_PTES_PER_PAGE;
+	bool flag = false;
 	
 	struct pagetable *pt = ptbr;
 	struct pte_directory *pd;
@@ -164,21 +184,36 @@ void free_page(unsigned int vpn)
 
 	pte = &pd->ptes[pte_index];
 	
-	if(mapcounts[pte->pfn]>=2){
-		mapcounts[pte->pfn]--; // count 내렸지만, 접근 불가 힘듬
-		mapcounts[pte->pfn]=0;
+	for (int i = 0; i < sizeof(tlb) / sizeof(*tlb); i++) {
+		struct tlb_entry *t = tlb + i;
+
+		if (!t->valid) continue;
+		else
+			if(t->vpn == vpn){
+				t->valid = false;
+				t->pfn = 0;
+				t->vpn = 0;
+			}
+	}	
+	
+	if(mapcounts[pte->pfn]>0){
+		mapcounts[pte->pfn]--;
 		pte->valid=false;
-		pte->writable=false;
-		pte->pfn=0;
-	}else{
-		mapcounts[pte->pfn]=0;
-		pte->valid=false;
+		pte->private=0;
 		pte->writable=false;
 		pte->pfn=0;
 	}
 	
+	for(int i=0;i<NR_PTES_PER_PAGE;i++){
+		if(!pd->ptes[i].valid) continue;
+		else{
+			flag=true;
+			break;
+		}
+	}
 	
-	
+	if(!flag)
+		free(pd);
 }
 
 
@@ -199,7 +234,31 @@ void free_page(unsigned int vpn)
  *   @false otherwise
  */
 bool handle_page_fault(unsigned int vpn, unsigned int rw)
-{
+{	
+	if(rw == RW_WRITE){
+		int pd_index = vpn / NR_PTES_PER_PAGE;
+		int pte_index = vpn % NR_PTES_PER_PAGE;
+		
+		struct pagetable *pt = ptbr;
+		struct pte_directory *pd;
+		struct pte *pte;
+		
+		pd = pt->outer_ptes[pd_index];
+
+		pte = &pd->ptes[pte_index];
+		
+		if(pte->private==1){
+			pte->writable = true;
+			mapcounts[pte->pfn]--;
+			
+			for(unsigned int i=0;i<NR_PAGEFRAMES;i++)
+				if(!mapcounts[i]){
+					pte->pfn = i;
+					mapcounts[i]++;
+					return true;
+				}
+		}
+	}
 	return false;
 }
 
@@ -224,21 +283,96 @@ bool handle_page_fault(unsigned int vpn, unsigned int rw)
  */
 void switch_process(unsigned int pid)
 {
-	struct process *a;
+	struct process *a = NULL;
+	struct pte_directory *pd, *npd;
+	struct pte *pte, *npte;
 	
 	list_for_each_entry(a, &processes, list){
 		if(a->pid == pid)
 			break;
-		else
-			a = NULL;
 	}
+	
+	if(a->pid != pid) a = NULL;
+		
 	if(!a){
-		//fork
-	}else{
 		struct process *new = (struct process*)malloc(sizeof(struct process));
 		new->pid = pid;
-		new->pagetable = current->pagetable;
-		new->list = current // PRODUCTING
+		
+		for (int i = 0; i < NR_PTES_PER_PAGE; i++) {
+			pd = current->pagetable.outer_ptes[i];
+
+			if (!pd) continue;
+			else {
+				new->pagetable.outer_ptes[i] = (struct pte_directory*)malloc(sizeof(struct pte_directory));
+				npd = new->pagetable.outer_ptes[i];
+				
+				for (int j = 0; j < NR_PTES_PER_PAGE; j++) {
+					pte = &pd->ptes[j];
+					if (!pte->valid) continue;
+					
+					npte = &npd->ptes[j];
+					npte->pfn = pte->pfn;
+					npte->private = pte->private;
+					npte->valid = true;
+					if(pte->writable){
+						npte->private = 1;
+						pte->private = 1;
+						pte->writable = false;
+					}
+					
+					mapcounts[pte->pfn]++;
+				}
+				
+			}
+		}	
+		
+		list_add(&current->list, &processes);
+		current = new;
+		ptbr = &new->pagetable;
+		for (int i = 0; i < sizeof(tlb) / sizeof(*tlb); i++) {
+			struct tlb_entry *t = tlb + i;
+
+			if (!t->valid) continue;
+			else{
+				t->valid = false;
+				t->pfn = 0;
+				t->vpn = 0;
+			}
+		}
+	}else{
+		for (int i = 0; i < NR_PTES_PER_PAGE; i++) {
+			pd = current->pagetable.outer_ptes[i];
+
+			if (!pd) continue;
+			else {
+				for (int j = 0; j < NR_PTES_PER_PAGE; j++) {
+					pte = &pd->ptes[j];
+					if (!pte->valid) continue;
+					
+					if(pte->writable){
+						pte->private = 1;
+						pte->writable = false;
+					}
+					
+				}
+				
+			}
+		}
+		list_add(&current->list, &processes);
+		list_del(&a->list);
+		current = a;
+		ptbr = &a->pagetable;
+		
+		for (int i = 0; i < sizeof(tlb) / sizeof(*tlb); i++) {
+			struct tlb_entry *t = tlb + i;
+
+			if (!t->valid) continue;
+			else{
+				t->valid = false;
+				t->pfn = 0;
+				t->vpn = 0;
+			}
+		}
 	}
 }
 
